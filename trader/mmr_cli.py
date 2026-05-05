@@ -1333,6 +1333,28 @@ def build_parser() -> argparse.ArgumentParser:
                                       help='Show statistical-confidence block for one or more runs (compact)')
     bts_conf_p.add_argument('run_ids', type=int, nargs='+',
                              help='One or more run ids')
+
+    # backtests correlation — pairwise Pearson on equity-curve daily
+    # returns across N runs. Returns the matrix + labels in compact JSON
+    # (~50 bytes/cell) so an LLM can rank candidate strategies for
+    # portfolio inclusion without ever loading the multi-MB curves.
+    bts_corr_p = bts_sub.add_parser(
+        'correlation',
+        help='Pairwise correlation matrix across runs\' equity curves (compact)',
+    )
+    bts_corr_p.add_argument('run_ids', type=int, nargs='+',
+                             help='Two or more run ids to correlate')
+    bts_corr_p.add_argument(
+        '--period-days', type=int, default=0,
+        help='Limit each curve to its last N trading days BEFORE intersection. '
+             '0 (default) = use full overlap.',
+    )
+    bts_corr_p.add_argument(
+        '--min-observations', type=int, default=20,
+        help='Floor on overlapping dates required to emit a matrix '
+             '(default: 20). Below this Pearson correlation is too noisy '
+             'to be useful.',
+    )
     bts_cmp_p = bts_sub.add_parser('compare', help='Compare two or more runs side-by-side')
     bts_cmp_p.add_argument('run_ids', type=int, nargs='+')
     bts_arc_p = bts_sub.add_parser('archive',
@@ -1363,6 +1385,20 @@ def build_parser() -> argparse.ArgumentParser:
     data_query_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')
     data_query_p.add_argument('--days', type=int, default=30, help='Days of history (default: 30)')
     data_query_p.add_argument('--tail', type=int, default=None, help='Show only last N rows')
+
+    # data stats — compact per-symbol descriptive stats. Same use case as
+    # `data query` but returns ~500 bytes (count, first/last bar, OHLC
+    # summary, daily-return summary) instead of the full bar series. The
+    # raw `data query` payload on a 1-min × 1y series is 40+ MB; not
+    # usable as an LLM tool result. Use this first to confirm coverage,
+    # then fall back to `data query` only when raw bars are genuinely
+    # needed (mostly for human inspection or backtester input).
+    data_stats_p = data_sub.add_parser(
+        'stats',
+        help='Compact descriptive stats for a symbol\'s local OHLCV data',
+    )
+    data_stats_p.add_argument('symbol', help='Symbol or conId')
+    data_stats_p.add_argument('--bar-size', default='1 day', help='Bar size (default: "1 day")')
 
     data_dl_p = data_sub.add_parser(
         'download',
@@ -4230,6 +4266,119 @@ def _handle_backtests(args: argparse.Namespace):
         console.print(tbl)
         return
 
+    if action == 'correlation':
+        # Pairwise Pearson correlation across N runs' equity-curve daily
+        # returns. The matrix + labels payload is ~50 bytes/cell so this
+        # is the LLM-friendly counterpart to `backtests show --include-raw`
+        # (which returns multi-MB curves). Used by portfolio-construction
+        # workflows that need to pick low-correlation stream subsets.
+        from trader.data.backtest_correlation import compute_correlation_matrix
+
+        if len(args.run_ids) < 2:
+            print_status(
+                'correlation needs at least 2 run ids — give the runs you want '
+                'to compare pairwise',
+                success=False,
+            )
+            return
+
+        labelled: list[tuple[str, str]] = []
+        missing: list[int] = []
+        no_curve: list[int] = []
+        for rid in args.run_ids:
+            rec = store.get(rid)
+            if rec is None:
+                missing.append(rid)
+                continue
+            if not rec.equity_curve_json:
+                no_curve.append(rid)
+                continue
+            # Label format mirrors `backtests confidence`'s identifying
+            # fields so the matrix is human-readable. e.g.
+            # "[42] OpeningRangeBreakout/AAPL".
+            sym_label = _format_conids_with_symbols(rec.conids)
+            label = f'[{rec.id}] {rec.class_name}/{sym_label}'
+            labelled.append((label, rec.equity_curve_json))
+
+        if missing:
+            print_status(f'Run(s) not found: {missing}', success=False)
+            return
+        if no_curve:
+            print_status(
+                f'Run(s) without equity_curve_json (re-run with --save-trades to '
+                f'persist the curve, or omit them): {no_curve}',
+                success=False,
+            )
+            return
+
+        period_days = getattr(args, 'period_days', 0) or None
+        min_obs = getattr(args, 'min_observations', 20)
+        result = compute_correlation_matrix(
+            labelled, period_days=period_days, min_observations=min_obs,
+        )
+
+        if _json_mode:
+            payload = {
+                'matrix': result.matrix,
+                'labels': result.labels,
+                'n_observations': result.n_observations,
+                'method': result.method,
+                'period_days': period_days,
+                'min_observations': min_obs,
+                'reason': result.reason,
+            }
+            print(json.dumps(
+                {'data': payload, 'title': 'Backtest Equity-Curve Correlation Matrix'},
+                default=str,
+            ))
+            return
+
+        # Rich output: matrix as a table, with diagonal in dim and
+        # off-diagonal cells coloured red (|r| > 0.5) / yellow (> 0.3) /
+        # green (≤ 0.3, the diversification-friendly band).
+        if result.matrix is None:
+            print_status(
+                f'No matrix: {result.reason}',
+                success=False,
+            )
+            return
+        from rich.table import Table
+        from rich.text import Text as _Text
+        from rich import box as _box
+        tbl = Table(
+            title=(
+                f'Equity-Curve Correlation — {len(result.labels)} run(s) '
+                f'over {result.n_observations} overlapping daily returns'
+            ),
+            box=_box.ROUNDED, pad_edge=False, show_lines=False,
+        )
+        tbl.add_column('', no_wrap=True, style='dim')
+        for lbl in result.labels:
+            tbl.add_column(lbl, justify='right', no_wrap=True)
+        for i, lbl in enumerate(result.labels):
+            row_cells: list[Any] = [lbl]
+            for j, _ in enumerate(result.labels):
+                r = result.matrix[i][j]
+                if i == j:
+                    row_cells.append(_Text('1.00', style='dim'))
+                else:
+                    abs_r = abs(r)
+                    if abs_r > 0.5:
+                        style = 'red'
+                    elif abs_r > 0.3:
+                        style = 'yellow'
+                    else:
+                        style = 'green'
+                    row_cells.append(_Text(f'{r:+.2f}', style=style))
+            tbl.add_row(*row_cells)
+        console.print(tbl)
+        console.print(
+            '[dim]green ≤ 0.3 (diversifying)  '
+            'yellow 0.3-0.5 (mild overlap)  '
+            'red > 0.5 (redundant)[/]'
+        )
+        return
+
     if action == 'compare':
         records = [store.get(rid) for rid in args.run_ids]
         missing = [rid for rid, rec in zip(args.run_ids, records) if rec is None]
@@ -6524,6 +6673,8 @@ def _handle_data(args: argparse.Namespace):
         _handle_data_summary()
     elif action == 'query':
         _handle_data_query(args)
+    elif action == 'stats':
+        _handle_data_stats(args)
     elif action == 'download':
         _handle_data_download(args)
     elif action == 'migrate-symbols':
@@ -6675,6 +6826,168 @@ def _try_get_exchange_calendar_for(security):
         except Exception:
             continue
     return None
+
+
+def _handle_data_stats(args: argparse.Namespace):
+    """Compact descriptive stats for one symbol's local OHLCV data.
+
+    Companion to `data query` — that command returns the raw bars (~40MB
+    for 1-min × 1y, unusable as an LLM tool_result); this returns ~500
+    bytes summarising coverage and OHLC/return distribution. Counterpart
+    on the backtest side is `backtests confidence` (compact stats over a
+    backtest run).
+    """
+    import datetime as dt
+
+    import numpy as np
+    import pandas as pd
+
+    from trader.container import Container
+    from trader.data.data_access import TickStorage
+    from trader.data.universe import UniverseAccessor
+    from trader.objects import BarSize
+
+    container = Container.instance()
+    cfg = container.config()
+    duckdb_path = cfg.get('duckdb_path', '')
+    if not duckdb_path:
+        print_status('duckdb_path not configured', success=False)
+        return
+
+    history_path = cfg.get('history_duckdb_path', '') or duckdb_path
+    storage = TickStorage(history_path)
+    accessor = UniverseAccessor(duckdb_path, cfg.get('universe_library', 'Universes'))
+
+    # Resolve to the storage key — same logic as `data query` so this
+    # works for both conId-keyed and ticker-string-keyed downloads.
+    symbol = args.symbol
+    storage_key: Union[int, str]
+    resolved_name = symbol
+    if symbol.isnumeric():
+        storage_key = int(symbol)
+        try:
+            results = accessor.resolve_symbol(storage_key, first_only=True)
+            if results:
+                resolved_name = results[0].symbol
+        except Exception:
+            pass
+    else:
+        results = accessor.resolve_symbol(symbol, first_only=True)
+        if results:
+            storage_key = results[0].conId
+            resolved_name = results[0].symbol
+        else:
+            storage_key = symbol
+
+    bar_size_str = getattr(args, 'bar_size', '1 day')
+    bar_size = BarSize.parse_str(bar_size_str)
+    tickdata = storage.get_tickdata(bar_size)
+
+    # Read the full series for the key. Stats over a partial window is a
+    # `data query --days N` use case; this command is "what coverage do I
+    # have for this symbol overall?".
+    df = tickdata.read(storage_key)
+    if df.empty:
+        empty = {
+            'symbol': resolved_name,
+            'storage_key': storage_key,
+            'bar_size': bar_size_str,
+            'bar_count': 0,
+            'reason': 'no bars in local DuckDB for this symbol+bar_size',
+        }
+        if _json_mode:
+            print(json.dumps({'data': empty, 'title': f'Data Stats: {symbol}'}, default=str))
+            return
+        print_status(empty['reason'], success=False)
+        return
+
+    # Coverage. Index is the bar timestamp.
+    first_ts = df.index.min()
+    last_ts = df.index.max()
+    bar_count = int(len(df))
+
+    # OHLC summary uses the close column (the canonical "what was it
+    # worth" reading); we emit min/max/mean/std at native float precision.
+    closes = df['close'].astype(float).dropna() if 'close' in df.columns else pd.Series([], dtype=float)
+    if not closes.empty:
+        ohlc_summary = {
+            'min': float(closes.min()),
+            'max': float(closes.max()),
+            'mean': float(closes.mean()),
+            'std': float(closes.std()) if len(closes) >= 2 else None,
+        }
+    else:
+        ohlc_summary = {'min': None, 'max': None, 'mean': None, 'std': None}
+
+    # Daily-return summary in basis points (more LLM-friendly than raw
+    # decimal returns; 1bp = 0.01%). Skew/kurtosis flag fat tails the
+    # mean alone won't show.
+    returns_summary: dict
+    if len(closes) >= 2:
+        rets = closes.pct_change().dropna()
+        if len(rets) >= 2:
+            returns_summary = {
+                'count': int(len(rets)),
+                'mean_bps': float(rets.mean() * 10_000),
+                'std_bps': float(rets.std() * 10_000),
+                'skew': float(rets.skew()) if len(rets) >= 3 else None,
+                'excess_kurtosis': float(rets.kurtosis()) if len(rets) >= 4 else None,
+            }
+        else:
+            returns_summary = {'count': int(len(rets)), 'mean_bps': None,
+                               'std_bps': None, 'skew': None, 'excess_kurtosis': None}
+    else:
+        returns_summary = {'count': 0, 'mean_bps': None, 'std_bps': None,
+                           'skew': None, 'excess_kurtosis': None}
+
+    payload = {
+        'symbol': resolved_name,
+        'storage_key': storage_key,
+        'bar_size': bar_size_str,
+        'bar_count': bar_count,
+        'first_bar': str(first_ts),
+        'last_bar': str(last_ts),
+        'span_days': (
+            int((last_ts - first_ts).total_seconds() // 86_400)
+            if hasattr(last_ts, '__sub__') else None
+        ),
+        'ohlc_close_summary': ohlc_summary,
+        'returns_per_bar_summary': returns_summary,
+    }
+
+    if _json_mode:
+        print(json.dumps(
+            {'data': payload, 'title': f'Data Stats: {resolved_name} @ {bar_size_str}'},
+            default=str,
+        ))
+        return
+
+    # Rich human-facing output: one compact table.
+    from rich.table import Table
+    from rich import box as _box
+    tbl = Table(
+        title=f'Data Stats — {resolved_name} @ {bar_size_str}',
+        box=_box.ROUNDED, pad_edge=False, show_lines=False,
+    )
+    tbl.add_column('field', style='dim')
+    tbl.add_column('value')
+    tbl.add_row('storage_key', str(storage_key))
+    tbl.add_row('bar_count', f'{bar_count:,}')
+    tbl.add_row('first_bar', str(first_ts))
+    tbl.add_row('last_bar', str(last_ts))
+    if payload['span_days'] is not None:
+        tbl.add_row('span_days', f'{payload["span_days"]:,}')
+    tbl.add_row('close_min', f'{ohlc_summary["min"]:.4f}' if ohlc_summary['min'] is not None else '—')
+    tbl.add_row('close_max', f'{ohlc_summary["max"]:.4f}' if ohlc_summary['max'] is not None else '—')
+    tbl.add_row('close_mean', f'{ohlc_summary["mean"]:.4f}' if ohlc_summary['mean'] is not None else '—')
+    if returns_summary['mean_bps'] is not None:
+        tbl.add_row('return_mean', f'{returns_summary["mean_bps"]:+.2f} bps')
+        tbl.add_row('return_std', f'{returns_summary["std_bps"]:.2f} bps')
+        if returns_summary['skew'] is not None:
+            tbl.add_row('return_skew', f'{returns_summary["skew"]:+.2f}')
+        if returns_summary['excess_kurtosis'] is not None:
+            tbl.add_row('excess_kurtosis', f'{returns_summary["excess_kurtosis"]:+.2f}')
+    console.print(tbl)
 
 
 def _handle_data_download(args: argparse.Namespace):

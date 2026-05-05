@@ -32,7 +32,7 @@ The trader_service can be configured to **refuse direct buy/sell RPCs entirely**
 - **data_service required**: history_massive, history_twelvedata, history_ib
 - **massive_api_key or twelvedata_api_key** (no service needed): balance_sheet, income_statement, cash_flow, ratios, `data_download`, `ideas` (default US path), `movers`, `movers_detail`, `snapshot`, `snapshot_batch`, `forex_snapshot`, `forex_quote`, `forex_convert`, and the live ticker dashboard (`watch SYM... --source twelvedata`) — all accept `source="massive"|"twelvedata"` (`forex_*` also takes `"ib"` for trader_service routing)
 - **massive_api_key only** (no service needed): filing_section, `options_expirations`, `options_chain`, `options_snapshot`, `options_implied`, `news`, `forex_snapshot` (massive source), `forex_movers`, `stream`
-- **No service needed**: universe_list, universe_show, universe_create, universe_delete, universe_remove, universe_import, status, market_hours, `data_summary`, `data_query`, `backtest`, `backtest_sweep`, `backtest_batch`, `backtests_list`, `backtests_show`, `backtests_confidence`, `backtests_archive`, `backtests_unarchive`, `sweep_run`, `sweeps_list`, `sweeps_show`, `strategies_inspect`, `strategy_create`, `strategy_deploy`, `strategy_undeploy`, `strategy_signals`, `strategy_backtest`, `propose`, `proposals`, `reject`, `session_limits`, `session_status`, `group_list`, `group_create`, `group_delete`, `group_show`, `group_add`, `group_remove`, `group_set`, `logs`
+- **No service needed**: universe_list, universe_show, universe_create, universe_delete, universe_remove, universe_import, status, market_hours, `data_summary`, `data_stats`, `data_query`, `backtest`, `backtest_sweep`, `backtest_batch`, `backtests_list`, `backtests_show`, `backtests_confidence`, `backtests_correlation`, `backtests_archive`, `backtests_unarchive`, `sweep_run`, `sweeps_list`, `sweeps_show`, `strategies_inspect`, `strategy_create`, `strategy_deploy`, `strategy_undeploy`, `strategy_signals`, `strategy_backtest`, `propose`, `proposals`, `reject`, `session_limits`, `session_status`, `group_list`, `group_create`, `group_delete`, `group_show`, `group_add`, `group_remove`, `group_set`, `logs`
 
 ## Reality check first — `preflight()` before anything else
 
@@ -343,6 +343,7 @@ Shapes deliberately differ between sources — we pass through what each provide
 | `MMRHelpers.backtests_list(sort_by="score", limit=25, sweep_id=None)` | Past runs ranked by composite quality score. Filter by strategy, sweep, or archive state. |
 | `MMRHelpers.backtests_show(run_id, include_raw=False)` | One run's full detail + statistical-confidence block. `include_raw=False` (default) omits MB-scale arrays. |
 | `MMRHelpers.backtests_confidence([ids])` | Bulk PSR/t-stat/CI/skew/streak for N runs (~500 bytes/run). The right post-sweep ranking tool. |
+| `MMRHelpers.backtests_correlation([ids], period_days=0, min_observations=20)` | **Pairwise Pearson correlation matrix across N runs' equity-curve daily returns** (~50 bytes/cell). The portfolio-construction counterpart to `backtests_confidence` — once individual runs pass the gates, use this to pick a low-correlation subset. Heterogeneous bar sizes are aligned: a 1-min curve is collapsed to last-of-day before correlating with a 1-day curve. `period_days=N` clips each curve to its last N trading days BEFORE the inter-curve date intersection (so a 5-year run doesn't drag a 6-month run). Returns `{matrix, labels, n_observations, reason}` — `matrix=null + reason` when overlap is below `min_observations`. |
 | `MMRHelpers.sweep_run(manifest_path, dry_run=False, concurrency=None)` | **Cron-able nightly sweep.** YAML manifest → expand → freshness-check → parallel run → digest in `~/.local/share/mmr/reports/`. See Pattern 14. |
 | `MMRHelpers.sweeps_list(limit=25)` | **Curated view** of what sweeps have ever run. Entry point for "what have we done?" |
 | `MMRHelpers.sweeps_show(id, top=10)` | One sweep's metadata + top-N leaderboard by composite score. |
@@ -362,9 +363,12 @@ Three things to know when working with backtests:
 
 | Method | Description |
 |--------|-------------|
-| `MMRHelpers.data_summary()` | What historical data is available locally |
-| `MMRHelpers.data_query(symbol, bar_size, days)` | Read OHLCV data from local DuckDB |
+| `MMRHelpers.data_summary()` | What historical data is available locally (universe-level) |
+| `MMRHelpers.data_stats(symbol, bar_size="1 day")` | **Compact** per-symbol stats: bar count, first/last bar, OHLC summary, daily-return mean/std/skew/kurt (~500 bytes) |
+| `MMRHelpers.data_query(symbol, bar_size, days)` | Read raw OHLCV bars from local DuckDB. **Multi-MB on intraday × 1y** — for inspection / backtester input only; LLM agents should prefer `data_stats` |
 | `MMRHelpers.data_download(symbols, bar_size, days, source="massive", force=False)` | Download to local DuckDB |
+
+**LLM agent rule of thumb**: use `data_stats` first to confirm coverage (count, span, return distribution). Only fall back to `data_query` when you actually need the bars themselves — e.g. for a one-off correlation calc. A 1-min × 365d `data_query` returns ~40 MB which won't fit in a typical agent context window even after truncation.
 
 `data_download` uses the freshness guard by default — repeat calls over the same window are a no-op (no API credits burned). Pass `force=True` only when you want to re-fetch stored days to pick up new coverage (e.g. switching sources, or after enabling TwelveData's extended-hours default). TwelveData intraday (1/5/15/30-min) defaults to `prepost=true` → ~960 bars per US trading day (04:00–19:59 ET); Massive returns 24h. All methods return JSON.
 
