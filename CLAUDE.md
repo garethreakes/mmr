@@ -309,6 +309,8 @@ backtests --card                            # card view instead of table
 backtests show 42                           # full detail (summary + statistical confidence)
 backtests show 42 --include-raw             # also ship trades_json + equity_curve_json (multi-MB)
 backtests confidence 42 43 44               # compact PSR/t-test/CI batch read across runs
+backtests correlation 42 43 44              # pairwise Pearson on equity-curve daily returns (~50 bytes/cell)
+backtests correlation 42 43 44 --period-days 252  # clip each curve to its last 252 trading days first
 backtests compare 40 41 42                  # side-by-side table
 backtests archive 42 43                     # hide from default list (reversible)
 backtests unarchive 42                      # restore
@@ -597,8 +599,9 @@ JSON output always follows the structure `{"data": ..., "title": ...}` for data 
 
 **Step 1: Explore available data** (no service needed)
 ```bash
-mmr --json data summary                                    # What data is in local DuckDB
-mmr --json data query AAPL --bar-size "1 day" --days 30    # Read OHLCV from local store
+mmr --json data summary                                    # What data is in local DuckDB (universe-level)
+mmr --json data stats AAPL --bar-size "1 day"              # Compact per-symbol stats (LLM-friendly, ~500 bytes)
+mmr --json data query AAPL --bar-size "1 day" --days 30    # Raw OHLCV bars (multi-MB on intraday — for backtester input, not LLM context)
 ```
 
 **Step 2: Download historical data** (no service needed, requires massive_api_key)
